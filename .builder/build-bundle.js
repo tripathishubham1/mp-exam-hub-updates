@@ -99,9 +99,23 @@ async function iforms() {
   return out.slice(0, 20);
 }
 
+/* ---------- every other government job an MP student can apply for (all-India + MP recruiters outside MPOnline) ---------- */
+const INDIA = (() => { try { return require('./sources-india.js'); } catch (e) { return require(path.join(__dirname, 'sources-india.js')); } })();
+let jobsCache = {};
+async function jobs() {
+  const parts = await Promise.allSettled([INDIA.discovery(jobsCache, CI ? 60 : 400), INDIA.ssc(), INDIA.upsc()]);
+  const [d, sc, up] = parts.map(p => p.status === 'fulfilled' ? p.value : null);
+  if (!d && !sc && !up) throw new Error(parts.map(p => p.reason && p.reason.message).filter(Boolean).join(' | '));
+  // listing rows are the recruitments themselves (posts, qualification, last date); the official SSC / UPSC readers add their notices
+  const list = [].concat(d || [], sc || [], up || []);
+  // what students need: open applications (last date today or later) and fresh notices without a last date (≤ 45 days old)
+  return list.filter(x => x.last ? parseD(x.last) >= today : (x.date && Date.now() - Date.parse(x.date) < 45 * 864e5)).map(x => Object.assign(x, { ext: true }));
+}
+
 /* ---------- what changed (prev → now) ---------- */
 const LABEL = {
   new: ['आवेदन शुरू', 'Applications open'],
+  job: ['नई भर्ती', 'New recruitment'],
   extended: ['अंतिम तिथि बढ़ी', 'Last date extended'],
   changed: ['अंतिम तिथि बदली', 'Last date changed'],
   late: ['विलंब शुल्क के साथ आवेदन', 'Late-fee window'],
@@ -121,7 +135,8 @@ function diff(prev, now, at) {
   const open = x => !!(x.last && parseD(x.last) >= today);
   for (const x of now) {
     const p = P.get(x.key);
-    if (!p) { if (!x.stages) push(x, 'advert', { url: x.pdf }); else if (open(x)) push(x, 'new', { detail: x.last }); continue; }
+    if (!p) { if (x.ext) push(x, 'job', { url: x.pdf || x.site, detail: x.last }); else if (!x.stages) push(x, 'advert', { url: x.pdf }); else if (open(x)) push(x, 'new', { detail: x.last }); continue; }
+    if (x.ext && x.last && p.last && x.last !== p.last) { push(x, parseD(x.last) > parseD(p.last) ? 'extended' : 'changed', { detail: p.last + ' → ' + x.last }); continue; }
     if (!x.stages) continue;
     if (x.last && p.last && x.last !== p.last) { const d1 = parseD(p.last), d2 = parseD(x.last); push(x, d2 > d1 ? 'extended' : 'changed', { detail: p.last + ' → ' + x.last }); }
     if (open(x) && p.last && !open(p) && !(x.last !== p.last)) push(x, 'reopen', { detail: x.last });
@@ -141,32 +156,37 @@ async function main() {
   fs.mkdirSync(OUT, { recursive: true });
   // local runs start from what the 15-minute cloud job last published, so its events are never overwritten
   if (!CI) for (const f of ['feed.json', 'events.json']) { try { fs.writeFileSync(path.join(OUT, f), await get('https://raw.githubusercontent.com/tripathishubham1/mp-exam-hub-updates/main/' + f + '?t=' + Date.now())); } catch (e) { } }
+  try { jobsCache = JSON.parse(fs.readFileSync(path.join(OUT, 'jobs-cache.json'), 'utf8')); } catch (e) { jobsCache = {}; }
+  if (!CI) { try { jobsCache = Object.assign(JSON.parse(await get('https://raw.githubusercontent.com/tripathishubham1/mp-exam-hub-updates/main/jobs-cache.json?t=' + Date.now())), jobsCache); } catch (e) { } }
   const parts = {}, errors = [];
-  for (const [k, fn] of Object.entries({ esb, mppscHub, mppscAdverts, iforms })) {
+  for (const [k, fn] of Object.entries({ esb, mppscHub, mppscAdverts, iforms, jobs })) {
     try { parts[k] = await fn(); } catch (e) { errors.push(k + ': ' + e.message); parts[k] = null; }
   }
   const prev = fs.existsSync(path.join(OUT, 'feed.json')) ? JSON.parse(fs.readFileSync(path.join(OUT, 'feed.json'), 'utf8')) : { sources: {} };
   // a source that failed keeps its previous items (no false "removed"/"closed" events from an outage)
-  const prevSrc = { esb: (prev.exams || []).filter(x => x.src === 'ESB'), mppscHub: (prev.exams || []).filter(x => x.src === 'MPPSC'), mppscAdverts: (prev.sources && prev.sources.mppscAdverts) || [], iforms: (prev.sources && prev.sources.iforms) || [] };
+  const prevSrc = { esb: (prev.exams || []).filter(x => x.src === 'ESB'), mppscHub: (prev.exams || []).filter(x => x.src === 'MPPSC'), mppscAdverts: (prev.sources && prev.sources.mppscAdverts) || [], iforms: (prev.sources && prev.sources.iforms) || [], jobs: (prev.sources && prev.sources.jobs) || [] };
   const sources = {}; for (const k of Object.keys(parts)) sources[k] = parts[k] || prevSrc[k] || [];
   const exams = [].concat(sources.esb, sources.mppscHub);
   // what the app lists: open application windows + recent advertisements / iForms notices
-  const items = [].concat(sources.esb, sources.mppscHub.filter(x => x.apply && parseD(x.last) >= today), sources.mppscAdverts, sources.iforms).map(x => Object.assign({}, x, { id: x.key }));
+  const items = [].concat(sources.esb, sources.mppscHub.filter(x => x.apply && parseD(x.last) >= today), sources.mppscAdverts, sources.iforms, sources.jobs).map(x => Object.assign({}, x, { id: x.key }));
   const at = new Date().toISOString();
   // events: diff against the last run (first run only sets the baseline)
   let events = fs.existsSync(path.join(OUT, 'events.json')) ? JSON.parse(fs.readFileSync(path.join(OUT, 'events.json'), 'utf8')).events || [] : [];
   const fresh = [];
   if (prev.exams) fresh.push(...diff(prev.exams, exams, at));
   if (prev.exams && prev.sources && prev.sources.mppscAdverts && parts.mppscAdverts) fresh.push(...diff(prev.sources.mppscAdverts, sources.mppscAdverts, at));
+  if (prev.sources && prev.sources.jobs && parts.jobs) fresh.push(...diff(prev.sources.jobs, sources.jobs, at));
   const seen = new Set(events.map(e => e.id)); for (const e of fresh.reverse()) if (!seen.has(e.id)) events.unshift(e);
   events = events.filter(e => Date.now() - Date.parse(e.at) < 120 * 864e5).slice(0, 300);
-  const feed = { at, items, exams, sources: { mppscAdverts: sources.mppscAdverts, iforms: sources.iforms }, errors };
+  const feed = { at, items, exams, sources: { mppscAdverts: sources.mppscAdverts, iforms: sources.iforms, jobs: sources.jobs.map(x => ({ key: x.key, src: x.src, title: x.title, last: x.last, ext: true, pdf: x.pdf || null, site: x.site || null })) }, errors };
   // nothing new since the last run: keep the published files untouched (no commit, no phone download)
   const same = JSON.stringify([prev.items, prev.exams, prev.sources]) === JSON.stringify([items, exams, feed.sources]);
   if (CI && same && !fresh.length) { console.log('no change in notices'); return; }
   if (same && prev.at) feed.at = prev.at;
   fs.writeFileSync(path.join(OUT, 'feed.json'), JSON.stringify(feed));
   fs.writeFileSync(path.join(OUT, 'events.json'), JSON.stringify({ at, events }));
+  // official links found so far (detail pages are fetched once per job)
+  const live = new Set(sources.jobs.map(x => x.key)); fs.writeFileSync(path.join(OUT, 'jobs-cache.json'), JSON.stringify(Object.fromEntries(Object.entries(jobsCache).filter(([k]) => live.has(k)))));
   if (!CI) {
     const rulesFile = path.join(ROOT, 'tools', 'rules', 'rules.json');
     const rulesObj = fs.existsSync(rulesFile) ? JSON.parse(fs.readFileSync(rulesFile, 'utf8')) : { exams: [] };
@@ -175,7 +195,7 @@ async function main() {
     // FEED_ONLY=1 (nightly checks failed): ship fresh notices but keep last night's agent + model
     for (const f of ['agent.js', 'fieldmodel.js', 'fieldmodel-data.js']) if (!(process.env.FEED_ONLY && fs.existsSync(path.join(OUT, f)))) fs.copyFileSync(path.join(ROOT, 'www', f), path.join(OUT, f));
     // the builder travels with the bundle so GitHub Actions runs exactly this code
-    fs.mkdirSync(path.join(OUT, '.builder'), { recursive: true }); fs.copyFileSync(__filename, path.join(OUT, '.builder', 'build-bundle.js'));
+    fs.mkdirSync(path.join(OUT, '.builder'), { recursive: true }); fs.copyFileSync(__filename, path.join(OUT, '.builder', 'build-bundle.js')); fs.copyFileSync(path.join(__dirname, 'sources-india.js'), path.join(OUT, '.builder', 'sources-india.js'));
   }
   const files = {};
   for (const f of ['feed.json', 'events.json', 'rules.json', 'agent.js', 'fieldmodel.js', 'fieldmodel-data.js']) { if (!fs.existsSync(path.join(OUT, f))) continue; const b = fs.readFileSync(path.join(OUT, f)); files[f] = { sha256: crypto.createHash('sha256').update(b).digest('base64'), size: b.length }; }
