@@ -139,6 +139,8 @@ function diff(prev, now, at) {
 
 async function main() {
   fs.mkdirSync(OUT, { recursive: true });
+  // local runs start from what the 15-minute cloud job last published, so its events are never overwritten
+  if (!CI) for (const f of ['feed.json', 'events.json']) { try { fs.writeFileSync(path.join(OUT, f), await get('https://raw.githubusercontent.com/tripathishubham1/mp-exam-hub-updates/main/' + f + '?t=' + Date.now())); } catch (e) { } }
   const parts = {}, errors = [];
   for (const [k, fn] of Object.entries({ esb, mppscHub, mppscAdverts, iforms })) {
     try { parts[k] = await fn(); } catch (e) { errors.push(k + ': ' + e.message); parts[k] = null; }
@@ -159,6 +161,10 @@ async function main() {
   const seen = new Set(events.map(e => e.id)); for (const e of fresh.reverse()) if (!seen.has(e.id)) events.unshift(e);
   events = events.filter(e => Date.now() - Date.parse(e.at) < 120 * 864e5).slice(0, 300);
   const feed = { at, items, exams, sources: { mppscAdverts: sources.mppscAdverts, iforms: sources.iforms }, errors };
+  // nothing new since the last run: keep the published files untouched (no commit, no phone download)
+  const same = JSON.stringify([prev.items, prev.exams, prev.sources]) === JSON.stringify([items, exams, feed.sources]);
+  if (CI && same && !fresh.length) { console.log('no change in notices'); return; }
+  if (same && prev.at) feed.at = prev.at;
   fs.writeFileSync(path.join(OUT, 'feed.json'), JSON.stringify(feed));
   fs.writeFileSync(path.join(OUT, 'events.json'), JSON.stringify({ at, events }));
   if (!CI) {
