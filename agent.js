@@ -401,6 +401,21 @@ function run(payload){
         const l = c.all;
         if (!kind) { const P=/photo|फोटो|फ़ोटो|छायाचित्र/i.test(l), S=/sign|हस्ताक्षर/i.test(l), H=/hand ?writ|हस्तलिपि|हस्तलिखित|composite|combined|संयुक्त/i.test(l); kind = (P&&S)||H ? 'composite' : S ? 'sign' : P ? 'photo' : null; }
         if (kind==='photo' && /हस्ताक्षर|sign/i.test(l) && !/फोटो|photo/i.test(c.labs.join(' '))) kind='sign';
+        // a document upload ("10th marksheet", "caste certificate" …): attach the saved scan in the format and size the box asks for
+        if (!kind && window.MPHubDocFmt) { const dk = window.MPHubDocFmt.kindFor(l); if (dk && files['doc_'+dk]) kind = 'doc_'+dk; }
+        if (kind && kind.startsWith('doc_')) {
+          const near = l + ' ' + (el.getAttribute('accept')||'') + ' ' + ((el.closest('tr,div,td,fieldset')||{}).innerText||'').slice(0,300);
+          const h = window.MPHubDocFmt.hint(near), acc = (el.getAttribute('accept')||'').toLowerCase();
+          const wantPdf = acc ? (/pdf/.test(acc) && !/image|jpe?g|png/.test(acc)) : (h.pdf && !h.jpg);
+          const maxKB = h.maxKB || 500, src = files[kind], label = c.short, input = el;
+          mark(el,'#1E7A4C'); rep.files.push({kind, l:label, fmt: wantPdf?'PDF':'JPG', maxKB}); changed++;
+          (async () => { try {
+              const blob = wantPdf ? await window.MPHubDocFmt.pdf(src, {maxKB}) : await window.MPHubDocFmt.fit(src, {maxKB});
+              const dt = new DataTransfer(); dt.items.add(new File([blob], kind.slice(4)+(wantPdf?'.pdf':'.jpg'), {type: blob.type}));
+              input.files = dt.files; input.dispatchEvent(new Event('input',{bubbles:true})); input.dispatchEvent(new Event('change',{bubbles:true}));
+            } catch(e) { mark(input,'#E0A100','manual'); } })();
+          continue;
+        }
         if (!kind || !files[kind]) { rep.manual.push(c.short+' (फ़ाइल)'); mark(el,'#E0A100','manual'); continue; }
         try { const dt=new DataTransfer(); dt.items.add(b64ToFile(files[kind], kind+'.jpg')); el.files=dt.files; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); mark(el,'#1E7A4C'); rep.files.push({kind, l:c.short}); changed++; }
         catch(e){ rep.manual.push(c.short+' (फ़ाइल)'); }

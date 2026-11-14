@@ -169,7 +169,9 @@ async function main() {
   fs.writeFileSync(path.join(OUT, 'events.json'), JSON.stringify({ at, events }));
   if (!CI) {
     const rulesFile = path.join(ROOT, 'tools', 'rules', 'rules.json');
-    fs.writeFileSync(path.join(OUT, 'rules.json'), fs.existsSync(rulesFile) ? fs.readFileSync(rulesFile) : '{"exams":[]}');
+    const rulesObj = fs.existsSync(rulesFile) ? JSON.parse(fs.readFileSync(rulesFile, 'utf8')) : { exams: [] };
+    const catFile = path.join(ROOT, 'tools', 'rules', 'catalog.json'); if (fs.existsSync(catFile)) rulesObj.catalog = JSON.parse(fs.readFileSync(catFile, 'utf8'));
+    fs.writeFileSync(path.join(OUT, 'rules.json'), JSON.stringify(rulesObj));
     // FEED_ONLY=1 (nightly checks failed): ship fresh notices but keep last night's agent + model
     for (const f of ['agent.js', 'fieldmodel.js', 'fieldmodel-data.js']) if (!(process.env.FEED_ONLY && fs.existsSync(path.join(OUT, f)))) fs.copyFileSync(path.join(ROOT, 'www', f), path.join(OUT, f));
     // the builder travels with the bundle so GitHub Actions runs exactly this code
