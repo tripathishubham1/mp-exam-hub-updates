@@ -1,0 +1,24 @@
+# Every 15 minutes: read the official MP exam portals, record what changed (events.json), re-sign, publish.
+# Only public notices; the agent/model files are left as the nightly run published them.
+name: refresh-notices
+on:
+  schedule: [{ cron: '*/15 * * * *' }]
+  workflow_dispatch: {}
+permissions: { contents: write }
+concurrency: { group: refresh, cancel-in-progress: false }
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Build notices + events and re-sign
+        env: { BUNDLE_CI: '1', SIGNING_KEY: '${{ secrets.SIGNING_KEY }}', TZ: 'Asia/Kolkata' }
+        run: node .builder/build-bundle.js .
+      - name: Publish if anything changed
+        run: |
+          if git diff --quiet -- feed.json events.json; then echo "no change"; git checkout -- .; exit 0; fi
+          git config user.name "MP Exam Hub bot"; git config user.email "tripathishubham1@users.noreply.github.com"
+          git add -A && git commit -q -m "Notices $(date -u +%Y-%m-%dT%H:%MZ)" && git push -q
