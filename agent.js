@@ -280,7 +280,7 @@ function setValue(el, v){
   const proto = el.tagName==='SELECT'?HTMLSelectElement.prototype:el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(proto,'value').set;
   try { el.focus({preventScroll:true}); } catch(e){}
-  setter.call(el, v);
+  setter.call(el, v); el.setAttribute('data-mphub-set','1');
   el.dispatchEvent(new Event('input',{bubbles:true}));
   el.dispatchEvent(new Event('change',{bubbles:true}));
   try { el.blur(); } catch(e){}
@@ -328,6 +328,7 @@ function askModel(label, context, el, type, options){
   const guess = M.predict(ex); return guess && guess.key!=='none' && guess.p>=0.6 ? {key: guess.key, sure: false, p: guess.p} : null;
 }
 /* a "@ domain" drop-down right next to an email box (options like gmail.com / yahoo.co.in) */
+const MODEL_NEEDS = { mobile:/mobile|phone|मोबाइल|फ़?फोन|contact|संपर्क|whatsapp|व्हाट्सएप/i, email:/e-?mail|ईमेल|ई-मेल/i, pincode:/\bpin\b|pin\s*code|pincode|पिन/i };
 const ALT_NO = /alternat|\balt(?:ernate)?\b|altphone|altmob|other\s*(?:mobile|number|phone)|second(?:ary)?\s*(?:mobile|number)|landline|वैकल्पिक|अन्य\s*मोबाइल/i;
 function emailDomainSelect(el){
   for (const box of [el.parentElement, el.parentElement&&el.parentElement.parentElement, el.closest('td,tr,.form-group,.row')].filter(Boolean)) {
@@ -350,21 +351,307 @@ function classify(el, values){
   let suggest = null;
   if (!key && el.type!=='file') { const m = askModel(labs.primary.join(' | '), labs.context.join(' | '), el, el.tagName==='SELECT'?'select':'text', el.tagName==='SELECT'?Array.from(el.options).map(o=>o.text):[]); if (m && m.sure) { key=m.key; how='model'; } else if (m) suggest=m.key; }
   if (key==='mobile' && ALT_NO.test(all+' '+fullId(el))) { key=null; suggest=null; }   // also after the model
+  if (how==='model' && MODEL_NEEDS[key] && !MODEL_NEEDS[key].test(all+' '+(el.placeholder||''))) { key=null; suggest=null; }
   return {key, how, short, labs:labs.primary.length?labs.primary:labs.context, all, suggest};
 }
 
+/* ---------- find the way to this job's application form ----------
+   On a page with no form (a home page, a Careers list, the job's own details page) every link is scored for being THIS
+   job's CURRENT application: its post name / advertisement number, this year, "apply online / registration" words, a
+   Careers / Recruitment section. Old years, results, admit cards, answer keys, interview lists and archives count
+   against it (stale or the wrong stage). The app follows only a sure link, a few hops at most; otherwise it highlights
+   the best ones for the student. Only links are followed, never buttons that send anything. */
+// words that appear on every recruiter's site (menus, other posts) say nothing about THIS job
+const WAY_GENERIC = new Set('recruitment various posts post officer officers the and for with notification online apply jobs vacancy vacancies advt advertisement contract basis regular deputation cum bank india indian limited ltd manager managers senior junior assistant assistants deputy general head chief executive executives staff more other others specialist specialists associate associates trainee trainees grade group level department national state central'.split(' '));
+const WAY_STALE = /\b(results?|answer\s*keys?|admit\s*cards?|call\s*letters?|hall\s*tickets?|interview\s*(schedule|list)|selected|selection\s*list|merit\s*list|marks|cut[\s-]*off|archives?|old\s*(notifications?|recruitments?)|expired|closed|corrigendum|score\s*card|document\s*verification|tender)\b|परिणाम|प्रवेश\s*पत्र|उत्तर\s*कुंजी/i;
+const WAY_APPLY = /apply\s*online|online\s*application|new\s*registration|\bregister\b|registration|application\s*form|apply\s*now|click\s*here\s*to\s*apply|online\s*form|create\s*(?:an?\s*|new\s*|your\s*)?(?:account|profile)|sign\s*-?\s*up|new\s*(?:user|candidate|applicant)|one\s*time\s*registration|\botr\b|ऑनलाइन\s*आवेदन|आवेदन\s*करें|पंजीयन|पंजीकरण|नया\s*खाता/i;
+const WAY_LOGIN = /\blog\s*-?in\b|sign\s*in|already\s*(?:registered|have\s*an?\s*account)|registered\s*(?:candidate|user)|existing\s*(?:user|candidate|account)|लॉग\s*इन/i;
+const WAY_HUB = /career|recruit|vacanc|current\s*opening|opportunit|employment|\bjobs?\b|भर्ती|रिक्ति/i;
+// a bank / university site's other services: loans, deposits, admissions … are never a job application
+const WAY_NOISE = /\bloans?\b|deposit|(?:savings|current|bank|demat|trading|salary|nre|nro|open\s*an?)\s*accounts?|credit\s*card|debit|insurance|locker|pension|tender|\brti\b|grievance|admission|study\s*in|scholarship|student\s*portal|e-?auction|complaint|feedback|scribe/i;
+const WAY_PLATFORM = /ibpsreg\.ibps\.in|ibpsonline\.ibps\.in|digialm\.com|rrbapply\.gov\.in|upsconline\.(nic|gov)\.in|ssc\.gov\.in|recruitment\.nta|onlineapplicationform/i;
+/* ---------- the navigator: understand the page, decide, act, check ----------
+   Runs on every page of a job opened from the jobs list until the application form (or its login / registration) is reached.
+   1. understand: what is this page? (this job's page, a careers list, a home page, another job, a result / admit card
+      page, closed, an error page …) with the evidence for it
+   2. decide, in this order: leave a wrong page (go back and try the next-best link) → follow a sure link to this job →
+      the address the notification PDF gives → the Careers section → open hidden menus / "Current openings" tabs →
+      the site's own search box → ask the student (best links in purple)
+   3. the app acts (click / open / back) and calls the agent again on the new page: that is the check.
+   It never presses buttons that send anything except a site's search box, and it explains each step ("think"). */
+const dec = u => { try { return decodeURIComponent(u); } catch(e) { return String(u||''); } };
+function jobSense(job){
+  const words = [...new Set(String(job.post||'').toLowerCase().replace(/[^a-z0-9 ]+/g,' ').split(' ').filter(w=>w.length>=4 && !WAY_GENERIC.has(w) && !/^\d+$/.test(w)))];
+  const advt = job.advt && String(job.advt).replace(/[^0-9a-z]/gi,'').length>=3 ? new RegExp(String(job.advt).replace(/[^0-9a-z]+/gi,'.{0,3}').replace(/^\.\{0,3\}|\.\{0,3\}$/g,''),'i') : null;
+  return {words, need:Math.min(2, words.length), advt, hints:(job.hints||[]).map(u=>String(u).split('#')[0].replace(/\/$/,'').toLowerCase())};
+}
+function understand(job){
+  const J = jobSense(job);
+  const title = norm(document.title||''), h1 = norm(Array.from(document.querySelectorAll('h1,h2')).slice(0,3).map(h=>h.innerText).join(' '));
+  const body = norm((document.body.innerText||'').slice(0,8000)), head = title+' '+h1;
+  const postIn = t => J.need > 0 && J.words.filter(w=>t.includes(w)).length >= J.need;
+  const advtIn = t => !!(J.advt && J.advt.test(t));
+  const ev = [];
+  if (/\b(404|not\s*found|page\s*(?:not|cannot)\s*be\s*found|error\s*occurred|service\s*unavailable|access\s*denied|forbidden)\b/i.test(head) || (body.length < 400 && /not\s*found|error/i.test(body))) return {kind:'error', ev:['error text']};
+  { const sentences = body.slice(0,4000).split(/[.।\n]/).filter(x=>/(registration|application|link|आवेदन)[^.]{0,40}(closed|expired|disabled|not\s*active|over|बंद|समाप्त)|last\s*date[^.]{0,30}(over|expired)/i.test(x));
+    if (sentences.length && !formLike() && (sentences.some(x=>postIn(x)||advtIn(x)) || (postIn(head) && sentences.length >= 1 && !/recruit.*recruit/i.test(body.slice(0,2000))))) return {kind:'closed', ev:['closed: '+sentences[0].slice(0,60)]}; }
+  const thisJob = WAY_PLATFORM.test(location.hostname) || advtIn(body) || (postIn(body) && /recruit|advertisement|advt|vacanc|apply|भर्ती|विज्ञापन/i.test(body) && /career|recruit|job|vacanc|opening|advt|notification/i.test(location.href+' '+title));
+  if (WAY_STALE.test(head) && !WAY_APPLY.test(head) && !thisJob) return {kind:'stale', ev:['heading: '+head.slice(0,40)]};
+  if (thisJob) { ev.push(advtIn(body)?'advt no':WAY_PLATFORM.test(location.hostname)?'application platform':'post named'); return {kind:'job', ev}; }
+  // a single recruitment's page that is NOT this job (another post / another advertisement)
+  if (/recruit|advertisement|advt|vacancy|notification|भर्ती/i.test(head) && /\b(20\d\d)\b|advt|no\.?\s*\d/i.test(head) && J.need && !postIn(head+' '+body.slice(0,3000)) && !advtIn(body) && document.querySelectorAll('a[href]').length < 120) {
+    const rows = Array.from(document.querySelectorAll('li,tr,.card,article')).filter(r=>/recruit|advt|vacanc|post/i.test(r.innerText||'') && (r.innerText||'').length < 600).length;
+    if (rows < 3) return {kind:'other-job', ev:['heading: '+head.slice(0,50)]};
+  }
+  const rows = Array.from(document.querySelectorAll('li,tr,.card,article')).filter(r=>(r.innerText||'').length < 600 && /recruit|advt|advertisement|vacanc|engagement|post of|posts|भर्ती/i.test(r.innerText||'')).length;
+  if (rows >= 3 || /career|recruit|vacanc|opening|jobs?\b/i.test(location.pathname+' '+title)) return {kind:'list', ev:[rows+' recruitment rows']};
+  if (/^\/?(?:index\.\w+|home|default\.\w+|en|hi|en\/|hi\/)?$/i.test(location.pathname)) return {kind:'home', ev:[]};
+  return {kind:'other', ev:[]};
+}
+function scoreLinks(job, ids, kind){
+  const J = jobSense(job), words = J.words, need = J.need, advt = J.advt;
+  const year = new Date().getFullYear(), seen = new Set(window.__mphubSeen||[]);
+  const hasId = !!(ids||{})[location.hostname.replace(/^www\./,'')] || !!window.__mphubHasLogin;
+  const pageIsJob = kind === 'job';
+  const out = []; let stale = 0;
+  document.querySelectorAll('[data-mphub-way]').forEach(e=>{ e.removeAttribute('data-mphub-way'); e.style.outline=''; });
+  for (const a of Array.from(document.querySelectorAll('a[href], a[routerlink], a.dropdown-item, .dropdown-menu a, [role=link], [role=menuitem], button[onclick*="location"], li[onclick] > *'))) {
+    if (!a.href && !visible(a)) continue;   // a script item is only useful when it can be tapped
+    const vis = visible(a);
+    const href = a.href || '', t = norm(a.innerText||a.textContent||a.getAttribute('title')||a.getAttribute('aria-label')||'');
+    if (!vis && !/^https?:/.test(href)) continue;           // hidden menu items count only when they have an address to open
+    if (!t && !href) continue;
+    if (/\.(jpe?g|png|zip|docx?|xlsx?)(\?|$)/i.test(href) || /^mailto:|^tel:|logout|signout|whatsapp|facebook|twitter|youtube|instagram|linkedin|t\.me/i.test(href)) continue;
+    if (/\.pdf(\?|#|$)/i.test(href)) continue;
+    if (href && /^https?:/.test(href) && (seen.has(href.split('#')[0]) || href.split('#')[0] === location.href.split('#')[0])) continue;
+    if (/drive\.google\.com\/file|docs\.google\.com\/(document|spreadsheets|presentation)/i.test(href)) continue;
+    let row = a.parentElement; while (row && row !== document.body && (row.innerText||'').trim().length < 80 && row.parentElement && (row.parentElement.innerText||'').length <= 700) row = row.parentElement;
+    if (row && (row === document.body || (row.innerText||'').length > 700)) row = null;
+    const ctx = norm(row ? row.innerText.slice(0,400) : '');
+    const own = t+' '+dec(href).toLowerCase(), all = own+' '+ctx;
+    let s = 0; const why = [];
+    const hit = words.filter(w=>all.includes(w)), postOk = need > 0 && hit.length >= need, advtOk = !!(advt && advt.test(all));
+    if (postOk) { s += 3*Math.min(hit.length,3); why.push('post'); }
+    if (advtOk) { s += 8; why.push('advt'); }
+    const hintOk = J.hints.some(h=>href.toLowerCase().replace(/\/$/,'').startsWith(h)); if (hintOk) { s += 10; why.push('pdf-address'); }
+    const ys = (all.match(/\b20\d\d\b/g)||[]).map(Number);
+    if (ys.some(y=>y>=year)) { s += 2; why.push('year'); } else if (ys.length && Math.max(...ys) < year-1) { s -= 8; why.push('old'); }
+    const my = own.match(/(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s_-]*(20\d\d)/i); if (my && +my[1] < year) { s -= 8; why.push('old-link'); }
+    const ap = WAY_APPLY.test(t) || (WAY_APPLY.test(ctx) && t.length < 30 && (postOk || advtOk));
+    if (ap) { s += (postOk||advtOk||pageIsJob) ? 4 : 1; why.push('apply'); if (pageIsJob && WAY_APPLY.test(t)) { s += 6; why.push('this-page'); } }
+    if (pageIsJob && WAY_LOGIN.test(t)) { s += hasId ? 12 : 2; why.push('login'); }
+    if (hasId && /new\s*registration|create\s*(?:an?\s*)?account|sign\s*-?\s*up|new\s*user/i.test(t)) { s -= 4; why.push('has-id'); }
+    if (/^https?:/.test(href)) { try { if (WAY_PLATFORM.test(new URL(href).hostname) && !WAY_PLATFORM.test(location.hostname)) { s += (postOk||advtOk) ? 6 : pageIsJob ? 4 : 1; why.push('platform'); } } catch(e){} }
+    if (WAY_NOISE.test(own)) { s -= 8; why.push('other-service'); }
+    const staleUrl = /\/(?:oecl[ab]|intcl[ab]|pecl[ab]|pocl[ab]|scda|cla|result|admit|callletter|scorecard|answerkey|marks)[_\-\/]|[?&](?:result|admit)/i.test(href);
+    const st = WAY_STALE.test(t) || (WAY_STALE.test(ctx) && !ap) || staleUrl; if (st) { s -= 10; why.push('stale'); if (postOk || advtOk) stale++; }
+    const hub = !st && WAY_HUB.test(t) && t.length < 40 && !WAY_NOISE.test(own); if (hub) { s += 3; why.push('hub'); }
+    const isJob = postOk || advtOk || hintOk || (ap && pageIsJob && WAY_APPLY.test(t));
+    if (a.closest('nav,header,footer,[role=navigation],.menu,.navbar,#menu') && !hub && !isJob) continue;   // site menus: only Careers or this job
+    if (!vis) { s -= 1; why.push('in-menu'); }
+    if (s <= 0) continue;
+    out.push({el:a, t:t.slice(0,60), href, s, why, job:isJob, hub, vis});
+  }
+  const applyTo = new Set(out.filter(c=>c.why.includes('this-page')).map(c=>c.href.split('#')[0]));
+  if (applyTo.size > 1) for (const c of out) if (c.why.includes('this-page') && !c.why.includes('post') && !c.why.includes('advt')) { c.s -= 6; c.why = c.why.filter(w=>w!=='this-page'); c.job = false; }
+  out.sort((x,y)=>y.s-x.s);
+  return {out, stale};
+}
+const T2 = (hi, en) => L10N(hi, en);
+function navigate(job, ids){
+  const U = understand(job), kind = U.kind, J = jobSense(job), hops = window.__mphubHops||0;
+  const tried = window.__mphubTried = window.__mphubTried || {};
+  const res = {kind, ev:U.ev, act:'ask', think:'', top:[], alts:[], stale:0};
+  const label = {job:T2('इस भर्ती का पेज','this job\'s page'), list:T2('भर्तियों की सूची','a list of recruitments'), home:T2('वेबसाइट का होम पेज','the website\'s home page'), other:T2('वेबसाइट का एक पेज','a page of the website')}[kind] || kind;
+  // 1. a wrong page: leave it and try the next-best link from before
+  if (kind === 'error') return Object.assign(res, {act:'back', think:T2('यह पेज खुला नहीं (त्रुटि). पिछला अगला-सबसे-अच्छा लिंक आज़मा रहे हैं…','This page didn\'t open (error). Trying the next-best link from before…')});
+  if (kind === 'stale') return Object.assign(res, {act:'back', think:T2('यह पुराना / परिणाम / एडमिट कार्ड वाला पेज है, आवेदन नहीं. वापस जाकर दूसरा लिंक देख रहे हैं…','This is an old / result / admit card page, not an application. Going back to try another link…')});
+  if (kind === 'other-job') return Object.assign(res, {act:'back', think:T2('यह किसी दूसरी भर्ती का पेज है. वापस जाकर सही भर्ती ढूँढ रहे हैं…','This page is for a different recruitment. Going back to find the right one…')});
+  if (kind === 'closed') return Object.assign(res, {act:'stop', think:T2('इस पेज के अनुसार आवेदन बंद है. अधिसूचना में अंतिम तिथि जाँचें.','This page says applications are closed. Check the last date in the notification.')});
+  const {out, stale} = scoreLinks(job, ids, kind); res.stale = stale;
+  let k = 0; const top = out.slice(0,3).map(c=>{ const i=k++; c.el.setAttribute('data-mphub-way', i); if (c.vis) mark(c.el, '#6C4CEF', 'way'); return {i, t:c.t, href:c.href, s:c.s, why:c.why.join(' '), job:c.job, hub:c.hub, vis:c.vis}; });
+  res.top = top; const best = top[0], second = top[1];
+  // other good options, kept by the app for going back
+  res.alts = out.slice(1,6).filter(c=>c.s >= 5 && /^https?:/.test(c.href) && (c.job || c.hub)).map(c=>c.href);
+  const sureJob = best && best.job && best.s >= 9 && (!second || !second.job || best.s - second.s >= 3 || best.href.split('#')[0] === second.href.split('#')[0]);
+  if (sureJob) return Object.assign(res, {act:'follow', pick:best, think:T2(label+' मिला. इसमें आपकी भर्ती का लिंक है: "'+best.t+'". उसे खोल रहे हैं…', 'Found '+label+'. It has your job\'s link: "'+best.t+'". Opening it…')});
+  // 2. the notification PDF printed the application address: go there
+  const hint = (job.hints||[]).find(h=>!(window.__mphubSeen||[]).includes(String(h).split('#')[0]) && !tried['hint:'+h]);
+  if (hint && hops < 6) { tried['hint:'+hint] = 1; return Object.assign(res, {act:'goto', href:hint, think:T2('अधिसूचना (PDF) में आवेदन का पता लिखा है. सीधे वहीं जा रहे हैं…','The notification (PDF) gives the application address. Going straight there…')}); }
+  // 3. a Careers / Recruitment section when nothing here is about this job
+  const hubLink = out.find(c=>c.hub && !c.job);
+  if (hubLink && !out.some(c=>c.job && c.s >= 6) && hops < 4 && kind !== 'job') {
+    const h = top.find(t=>t.href === hubLink.href) || (hubLink.el.setAttribute('data-mphub-way', 9), {i:9, t:hubLink.t, href:hubLink.href, vis:hubLink.vis});
+    return Object.assign(res, {act:'follow', pick:h, think:T2(label+' पर इस भर्ती का लिंक नहीं है. "'+hubLink.t+'" सेक्शन खोल रहे हैं, भर्तियाँ वहीं होती हैं…', 'No link to this job on '+label+'. Opening the "'+hubLink.t+'" section, where recruitments are listed…')});
+  }
+  // 4. hidden parts of the page: menus that are folded, "Current openings / Notifications" tabs and accordions
+  const toggles = Array.from(document.querySelectorAll('button,[role=tab],[aria-expanded="false"],[data-toggle],[data-bs-toggle],.accordion-button,.menu-toggle,.navbar-toggler,summary,li.dropdown > a[href="#"],a[href="#"],a[href^="javascript"]'))
+    .filter(e=>visible(e) && !tried['t:'+norm(e.innerText||e.getAttribute('aria-label')||e.className).slice(0,40)])
+    .map(e=>{ const t = norm(e.innerText||e.getAttribute('aria-label')||''); let s = 0;
+      if (/current|open(ing)?s?|recruit|career|vacanc|notification|advertisement|job|भर्ती|रिक्ति/i.test(t)) s += 5;
+      if (WAY_APPLY.test(t) || WAY_LOGIN.test(t) || /^apply$/i.test(t.trim())) s += 7;
+      if (/download|format|forms?\s*download|gallery|media|tender/i.test(t)) s -= 4;
+      if (J.need && J.words.some(w=>t.includes(w))) s += 4;
+      if (/menu|navigation|toggle|hamburger/i.test(t+' '+e.className+' '+(e.getAttribute('aria-label')||'')) && !out.some(c=>c.hub||c.job)) s += 3;
+      if (WAY_STALE.test(t) || WAY_NOISE.test(t)) s -= 6; return {e, t, s}; })
+    .filter(x=>x.s >= 3).sort((a,b)=>b.s-a.s);
+  if (toggles.length && hops < 8) { const x = toggles[0]; tried['t:'+norm(x.e.innerText||x.e.getAttribute('aria-label')||x.e.className).slice(0,40)] = 1; x.e.setAttribute('data-mphub-way', 8);
+    return Object.assign(res, {act:'open', pick:{i:8, t:x.t||'menu'}, think:T2('पेज का छिपा हिस्सा खोल रहे हैं ("'+(x.t||'मेन्यू')+'"), भर्ती का लिंक वहाँ हो सकता है…','Opening a hidden part of the page ("'+(x.t||'menu')+'"); the job link may be there…')}); }
+  // 5. the site's own search box
+  const sb = !tried.search && Array.from(document.querySelectorAll('input[type=search],input[name*=search i],input[id*=search i],input[placeholder*=search i],input[name=q],input[name=s]')).find(e=>!e.disabled && (visible(e) || e.closest('form')));
+  if (sb && hops < 8) { tried.search = 1; const q = (J.words.slice(0,3).join(' ') || 'recruitment');
+    return Object.assign(res, {act:'search', q, think:T2('इस पेज पर लिंक नहीं मिला. वेबसाइट के सर्च में "'+q+'" खोज रहे हैं…','No link on this page. Searching the website for "'+q+'"…')}); }
+  // 6. nothing sure here: the app goes back to another good link if it has one, else the student chooses
+  if (stale && !(best && best.job)) return Object.assign(res, {act:'back', staleOnly:true, think:T2('इस वेबसाइट पर इस पद के सिर्फ़ पुराने लिंक हैं (परिणाम / एडमिट कार्ड / पुरानी भर्ती). इस भर्ती का आवेदन लिंक शायद अभी शुरू नहीं हुआ.','This website only has old links for this post (results / admit cards / earlier recruitment). This job\'s apply link may not be live yet.')});
+  const btns = Array.from(document.querySelectorAll('button,input[type=submit],input[type=button],a.btn,[role=button]')).filter(b=>visible(b) && /regist|sign\s*up|log\s*-?in|sign\s*in|apply|पंजीयन|पंजीकरण|लॉग/i.test(b.value||b.innerText||'') && !b.closest('header,footer,nav'));
+  if (btns.length && (WAY_PLATFORM.test(location.hostname) || kind === 'job' || /recruit|career|rect/i.test(location.hostname+location.pathname))) { btns.slice(0,3).forEach(b=>mark(b, '#6C4CEF', 'way'));
+    return Object.assign(res, {act:'ask', portal:true, think:T2('यह आवेदन पोर्टल है. पहली बार हैं तो "Register" दबाएँ, एजेंट रजिस्ट्रेशन भरेगा. पहले से रजिस्टर हैं तो "Login". बटन बैंगनी रंग में हैं.','This is the application portal. First time? Tap "Register" and the agent fills the registration. Already registered? Tap "Login". The buttons are in purple.')}); }
+  if (best) return Object.assign(res, {act:'back-or-ask', think:T2(label+' पर पक्का लिंक नहीं मिला. बैंगनी लिंक सबसे करीब लगते हैं: सही लगे तो दबाएँ.','No sure link on '+label+'. The purple links look closest: tap the right one.')});
+  return Object.assign(res, {act:'back-or-ask', think:T2('इस पेज पर इस भर्ती का आवेदन लिंक नहीं मिला. मेन्यू में "Careers / Recruitment" देखें; फॉर्म खुलते ही एजेंट भरेगा.','Couldn\'t find this job\'s apply link on this page. Look for "Careers / Recruitment" in the menu; the agent fills as soon as the form opens.')});
+}
+/* the app asks the agent to search the site: type into the search box and send the search (never anything else) */
+function siteSearch(q){
+  const sb = Array.from(document.querySelectorAll('input[type=search],input[name*=search i],input[id*=search i],input[placeholder*=search i],input[name=q],input[name=s]')).find(e=>!e.disabled);
+  if (!sb) return false;
+  const tog = document.querySelector('[class*=search] button,[aria-label*=search i]'); if (!visible(sb) && tog) tog.click();
+  setValue(sb, q); sb.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:13,bubbles:true})); sb.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',keyCode:13,bubbles:true}));
+  const f = sb.closest('form'); if (f) { const btn = f.querySelector('button[type=submit],input[type=submit],button:not([type])'); if (btn) btn.click(); else if (f.requestSubmit) f.requestSubmit(); else f.submit(); }
+  return true;
+}
+// kept for older callers / tests
+function findWay(job, ids){ const n = navigate(job, ids); return Object.assign(n, {sure: n.act==='follow', portal: !!n.portal, pageIsJob: n.kind==='job'}); }
+
+/* an application form, not a site's search / feedback / newsletter / chat boxes or a login-only page */
+function formLike(){
+  const f = Array.from(document.querySelectorAll('input,select,textarea')).filter(e=>!e.disabled && e.type!=='hidden' && !['submit','button','image','reset','checkbox','radio','file','range'].includes(e.type) && visible(e)
+    && !e.closest('header,footer,nav,[role=search],[role=navigation],form[role=search],.search,#search')
+    && !/search|query|keyword|\bq\b|feedback|suggest|newsletter|subscribe|chat|branch|ifsc|locator|language|lang|captcha|otp|password|pwd|calculator|emi|amount|tenure|loan|rate|months?|value|slider/i.test((e.id||'')+' '+(e.name||'')+' '+(e.placeholder||'')+' '+(e.getAttribute('aria-label')||'')+' '+e.type));
+  if (/docs\.google\.com\/forms|forms\.gle|forms\.office/i.test(location.href)) return true;
+  if (document.querySelector('input[type=password]')) return true;   // login / registration pages are handled as such
+  if (f.length < 3) return false;
+  // in job mode the form must be an application (an enquiry / loan / contact form on a home page is not)
+  const box = f[0].closest('form') || f[0].closest('main,section,article') || document.body;
+  const ctx = location.href+' '+document.title+' '+(box === document.body ? '' : String(box.innerText||'').slice(0,3000));
+  return WAY_PLATFORM.test(location.hostname) || /recruit|application|applicant|candidate|registration|regist|apply|vacanc|post\s*applied|भर्ती|आवेदन|पंजीयन|पंजीकरण|अभ्यर्थी/i.test(ctx);
+}
+/* ---------- portal logins: strong password on registration, saved login on the login page, OTP from SMS ----------
+   The student asked for this: the app keeps each portal's user ID + password (encrypted on the phone) and fills them.
+   Registration page (password + confirm password): a strong password that meets the portal's own rules is made here,
+   typed into both boxes and handed to the app's vault. Login page: the saved user ID + password of THIS portal only.
+   Captcha, the final Submit and payment stay with the student. */
+function pwRules(el){
+  const near = norm(((el.closest('tr,div,li,fieldset,form')||document.body).innerText||'').slice(0,1500)) + ' ' + norm(el.title||'') + ' ' + norm(el.placeholder||'');
+  let min = Number(el.getAttribute('minlength'))||0, max = Number(el.getAttribute('maxlength'))||0;
+  const r = near.match(/(\d{1,2})\s*(?:to|-|–|and)\s*(\d{1,2})\s*(?:characters|chars|अक्षर)/i); if (r) { min = Math.max(min, +r[1]); max = max ? Math.min(max, +r[2]) : +r[2]; }
+  const mn = near.match(/(?:minimum|at\s*least|min\.?)\s*(?:of\s*)?(\d{1,2})\s*(?:characters|chars)/i); if (mn) min = Math.max(min, +mn[1]);
+  const mx = near.match(/(?:maximum|not\s*more\s*than|max\.?)\s*(?:of\s*)?(\d{1,2})\s*(?:characters|chars)/i); if (mx) max = max ? Math.min(max, +mx[1]) : +mx[1];
+  // the symbols the portal lists ("special character (@ # $ % & *)"), else a safe common set
+  const sm = near.match(/special\s*char[a-z]*[^@#$%&*!^_.\-]{0,40}([@#$%&*!^_.\-](?:[\s,]*[@#$%&*!^_.\-]){1,12})/i);
+  const sym = sm ? sm[1].replace(/[\s,]/g,'') : '@#$%&*!';
+  return {min: min||10, max: max||14, sym};
+}
+function makePassword(rule){
+  const R = n => { const a = new Uint32Array(1); crypto.getRandomValues(a); return a[0] % n; };
+  const len = Math.max(Math.max(rule.min, 10), Math.min(rule.max, 14));
+  const up='ABCDEFGHJKLMNPQRSTUVWXYZ', lo='abcdefghijkmnpqrstuvwxyz', dg='23456789', sy=rule.sym||'@#$%&*!';
+  const ch = [up[R(up.length)], lo[R(lo.length)], dg[R(dg.length)], sy[R(sy.length)]];
+  const all = up+lo+dg; while (ch.length < len) ch.push(all[R(all.length)]);
+  for (let i=ch.length-1;i>0;i--){ const j=R(i+1); [ch[i],ch[j]]=[ch[j],ch[i]]; }
+  if (sy.includes(ch[0])) { const k = ch.findIndex(c=>!sy.includes(c)); [ch[0],ch[k]]=[ch[k],ch[0]]; }
+  return ch.join('');
+}
+/* calendar boxes (read-only inputs with a date picker: jQuery UI, flatpickr, bootstrap-datepicker …): set the date the way
+   the picker itself would, so the portal's own checks see it. Only dates the profile has (date of birth, certificate dates). */
+function fillPickerDates(values, iso, rep){
+  const boxes = Array.from(document.querySelectorAll('input')).filter(e=>e.readOnly && !e.disabled && visible(e) && !e.value && /^(text|date|)$/.test(e.type));
+  for (const el of boxes) {
+    const labs = labelsOf(el), hint = norm(labs.primary.concat(labs.context).join(' ')+' '+(el.placeholder||'')+' '+fullId(el));
+    if (!/date|dob|birth|तिथि|दिनांक|dd\/mm|mm\/dd/.test(hint)) continue;
+    let key = keyFromId(el) || (keyFromLabel(labs.primary)||{}).key || (/birth|dob|जन्म/.test(hint) ? 'dob' : null);
+    if (!key || !DATE_KEYS.test(key) || !iso[key]) continue;
+    const [y,m,d] = iso[key].split('-'), when = new Date(+y, +m-1, +d), text = formatDate(iso[key], el);
+    const jq = window.jQuery;
+    try {
+      if (jq && jq.fn && jq.fn.datepicker && jq.data(el,'datepicker')) {          // jQuery UI
+        jq(el).datepicker('setDate', when); const inst = jq.data(el,'datepicker'), os = inst && inst.settings && inst.settings.onSelect;
+        if (os) os.call(el, el.value, inst); jq(el).trigger('change');
+      } else if (el._flatpickr) el._flatpickr.setDate(when, true);                  // flatpickr
+      else if (jq && jq(el).data && jq(el).data('datepicker') && jq(el).datepicker) jq(el).datepicker('update', when).trigger('changeDate');   // bootstrap-datepicker
+      else { el.readOnly = false; setValue(el, text); el.readOnly = true; }
+    } catch(e) { el.readOnly = false; setValue(el, text); el.readOnly = true; }
+    if (!el.value) { el.readOnly = false; setValue(el, text); el.readOnly = true; }
+    ['input','change','blur'].forEach(t=>el.dispatchEvent(new Event(t,{bubbles:true})));
+    if (el.value) { mark(el,'#1E7A4C'); el.removeAttribute('data-mphub'); rep.filled.push({k:key, l:String(labs.primary[0]||key).slice(0,90), v:el.value, how:'picker'}); }
+  }
+}
+function credentials(payload, rep){
+  const pw = Array.from(document.querySelectorAll('input[type=password]')).filter(e=>!e.disabled && !e.readOnly && visible(e));
+  if (!pw.length) return;
+  const textBoxes = Array.from(document.querySelectorAll('input')).filter(e=>/^(text|email|tel|number|)$/.test(e.type) && !e.disabled && visible(e));
+  const isUserBox = e => /user|login|regist|reg\.?\s*no|enrol|candidate\s*id|application\s*(no|id)|email|mobile|यूज़र|पंजीयन/i.test(fullId(e)+' '+labelsOf(e).primary.join(' ')+' '+(e.placeholder||'')) && !/captcha|otp|code/i.test(fullId(e)+' '+labelsOf(e).primary.join(' '));
+  const isOldPw = e => /old|current|existing|पुराना/i.test(fullId(e)+' '+labelsOf(e).primary.join(' '));
+  const fresh = pw.filter(e=>!isOldPw(e));
+  if (fresh.length >= 2 && fresh.every(e=>!e.value)) {
+    // registration / create password: one strong password in both boxes
+    const p = makePassword(pwRules(fresh[0]));
+    fresh.forEach(e=>{ setValue(e, p); mark(e,'#1E7A4C'); });
+    const v = payload.values||{}, userBox = textBoxes.find(isUserBox);
+    const user = (userBox && userBox.value) || v.email || v.mobile || '';
+    rep.newCred = {pass:p, user}; rep.filled.push({k:'password', l:L10N('पासवर्ड (मज़बूत, ऐप में सेव)','Password (strong, saved in the app)'), v:'••••••••', how:'vault'});
+    return;
+  }
+  const login = payload.login;
+  if (fresh.length === 1 && login && login.pass && !fresh[0].value) {
+    setValue(fresh[0], login.pass); mark(fresh[0],'#1E7A4C');
+    const ub = textBoxes.find(e=>!e.value && isUserBox(e)) || textBoxes.find(e=>!e.value && !/captcha|otp|code/i.test(fullId(e)+' '+labelsOf(e).primary.join(' ')));
+    if (ub && login.user) { setValue(ub, login.user); mark(ub,'#1E7A4C'); }
+    rep.loginFilled = true; rep.filled.push({k:'password', l:L10N('लॉगिन (ऐप में सेव)','Login (saved in the app)'), v:(login.user||'')+' / ••••••••', how:'vault'});
+  }
+}
+/* the OTP the app read from the SMS (with the student's one-tap consent) */
+function fillOtp(code){
+  const boxes = Array.from(document.querySelectorAll('input')).filter(e=>!e.disabled && visible(e) && !e.value && /(^|[_$\s-])(txt)?otp|one.?time|verification\s*code|enterotp|verifyotp|ओटीपी/i.test(fullId(e)+' '+labelsOf(e).primary.join(' ')+' '+(e.placeholder||'')));
+  if (!boxes.length) return false;
+  // split OTP boxes (one digit each)
+  if (boxes.length >= code.length && boxes.every(b=>Number(b.getAttribute('maxlength'))===1)) { code.split('').forEach((c,i)=>setValue(boxes[i], c)); }
+  else setValue(boxes[0], code);
+  boxes.forEach(b=>mark(b,'#1E7A4C'));
+  return true;
+}
 /* ---------- main ---------- */
 /* exam lists / portal home pages: nothing to fill here, the app navigates to the exam's own form */
 const HUB_PATH = /attestation\/home\/home\.aspx$|\/vyapam\/examslist\.aspx$|^\/?$|\/default\.aspx$|\/index\.aspx$/i;
+/* a sign-up meant only for the organisation's own staff (official e-mail domain, employee number): never fill it */
+const STAFF_ONLY = /(registration|sign\s*-?\s*up|login|account)[^.।\n]{0,60}\bonly\b[^.।\n]{0,40}(employees?|staff|officials?|officers?|@[a-z0-9-]+(\.[a-z0-9-]+)+)|only\s+for\s+(serving|existing|departmental|company|our)\s+(employees?|staff)|(official|company)\s+@[a-z0-9-]+(\.[a-z0-9-]+)+\s*e-?mail|केवल\s+(विभागीय\s+)?(कर्मचारि|अधिकारि)/i;
+function staffOnly(){ return STAFF_ONLY.test((document.body && document.body.innerText) || ''); }
+function staffBanner(){
+  if (document.getElementById('mphub-staff')) return;
+  const d = document.createElement('div'); d.id = 'mphub-staff';
+  d.style.cssText = 'position:fixed;left:12px;right:12px;top:12px;z-index:2147483647;background:#7A1E1E;color:#fff;padding:14px 16px;border-radius:12px;font:600 15px/1.4 system-ui,sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.35)';
+  d.textContent = 'यह पेज सिर्फ़ इस विभाग के अपने कर्मचारियों के लिए है, भर्ती के उम्मीदवारों के लिए नहीं. यहाँ कुछ न भरें. This page is only for the organisation\'s own employees, not for job applicants. Do not fill it.';
+  d.onclick = () => d.remove(); document.body.appendChild(d);
+}
 function run(payload){
+  if (payload && payload.job) lastPayload = payload;
+  window.__mphubHasLogin = !!(payload && payload.login && payload.login.pass);
   // (single-page portals like rrbapply.gov.in keep their forms at "/" behind a #/route: a page with a real form is never a hub)
   const formy = Array.from(document.querySelectorAll('input[type=text],input:not([type]),input[type=email],input[type=tel],select,textarea')).filter(e=>!e.disabled && visible(e)).length >= 3;
-  if (HUB_PATH.test(location.pathname) && !/Message=/.test(location.search) && !formy) return {filled:[], already:[], conflict:[], manual:[], blocked:0, files:[], checkboxes:0, postback:false, unknown:[], page:document.title, version:VERSION, stage:'hub'};
+  if (HUB_PATH.test(location.pathname) && !/Message=/.test(location.search) && !formy) {
+    const r = {filled:[], already:[], conflict:[], manual:[], blocked:0, files:[], checkboxes:0, postback:false, unknown:[], page:document.title, version:VERSION, stage:'hub', host:location.hostname};
+    // a job opened from the jobs list: find the way from this home page to its application form
+    if (payload.job) { r.way = findWay(payload.job, payload.portalIds); r.stage = 'find'; }
+    return r;
+  }
+  if (payload.job && !formLike()) { const r = {filled:[], already:[], conflict:[], manual:[], blocked:0, files:[], checkboxes:0, postback:false, unknown:[], page:document.title, version:VERSION, stage:'find', host:location.hostname};
+    r.way = findWay(payload.job, payload.portalIds); return r; }
+  if (staffOnly()) { const r = {filled:[], already:[], conflict:[], manual:[], blocked:0, files:[], checkboxes:0, postback:false, unknown:[], page:document.title, version:VERSION, stage:'staff', host:location.hostname, url:location.href};
+    staffBanner(); return r; }
   const iso = payload.iso||{}, files = payload.files||{};
   const values = derive(payload.values||{}, iso);
   const rep = {filled:[], already:[], conflict:[], manual:[], blocked:0, files:[], checkboxes:0, postback:false, page:document.title||location.hostname, version:VERSION, unknown:[]};
   let uSeq = 0; document.querySelectorAll('[data-mphub-u]').forEach(e=>{ uSeq=Math.max(uSeq, Number(e.getAttribute('data-mphub-u'))+1); });
   const askAI = (els, label, ctx, type, options) => { if (els[0].hasAttribute('data-mphub-u') || els[0].hasAttribute('data-mphub-key') || rep.unknown.length>=40) return; const i=uSeq++; els.forEach(e=>e.setAttribute('data-mphub-u', i)); rep.unknown.push({i, label:String(label||'').slice(0,300), context:String(ctx||'').slice(0,300), type, options:(options||[]).map(o=>String(o).slice(0,80)).slice(0,20)}); };
+  fillPickerDates(values, iso, rep);
   const done = new Set(), postbacks = [];
   ENGLISH_ONLY = /(अंग्रेज़ी|अंग्रेजी)s*(मे|में)s*(ही )?(भरे|भरें)|in english only|only in english|english capital letters only/i.test(document.body.innerText||'');
   rep.englishOnly = ENGLISH_ONLY;
@@ -487,6 +774,10 @@ function run(payload){
   });
   rep.manual = Array.from(new Set(rep.manual.filter(m=>m && !cleared.has(m)))).slice(0,40);
   rep.manualCount = stillNeeded.size;
+  // leave every filled box once more, now that all are filled: portals build combined fields on blur
+  // (IBPS: Full Name = first + middle + last). In the app the boxes never really get focus, so el.blur() alone does nothing.
+  document.querySelectorAll('input[data-mphub-set]:not([type=radio]):not([type=checkbox]),textarea[data-mphub-set]').forEach(el=>{ try { el.dispatchEvent(new Event('blur')); el.dispatchEvent(new FocusEvent('focusout',{bubbles:true})); } catch(e){} });
+  credentials(payload, rep);
   watchForNewFields(payload);
 
   // which step of the portal is this?
@@ -518,10 +809,20 @@ function run(payload){
       if (prof && /candidateprofil|profil|registration/i.test(path+t.slice(0,400))) capture.esbProfile = prof;
       if (app) capture.appNo = app;
       const txn = near('transaction (id|no)|ट्रांजेक्शन (आईडी|क्रमांक)'); if (txn) capture.txn = txn;
+      // the ID this portal will ask for at login next time (registration no / user ID), remembered per portal
+      const pid = near('registration (no|number|id)|user ?(id|name)|login ?id|candidate ?id|enrol+ment (no|number|id)|पंजीयन क्रमांक|पंजीकरण (क्रमांक|संख्या)') || prof;
+      if (pid) capture.portalId = pid;
     }
   }
   if (Object.keys(capture).length) rep.capture = capture;
-  rep.stage = msgClosed ? 'closed' : isError ? 'error' : rep.capture ? 'success' : isHub ? 'hub' : otpField ? 'otp' : (hasPassword && textInputs<=4) ? 'login' : decl ? 'notice' : (closedText||closedForm) ? 'closed' : (hasProfile && textInputs<=4) ? 'profile' : 'form';
+  rep.stage = msgClosed ? 'closed' : isError ? 'error' : rep.capture ? 'success' : isHub ? 'hub' : (otpField && textInputs <= 4) ? 'otp' : (hasPassword && textInputs<=4) ? 'login' : decl ? 'notice' : (closedText||closedForm) ? 'closed' : (hasProfile && textInputs<=4) ? 'profile' : 'form';
+  rep.host = location.hostname; rep.url = location.href; rep.otpField = !!otpField;
+  // login page: the portal's user ID / registration number saved from this portal's earlier success page (never a password)
+  if (rep.stage === 'login') { const id = (payload.portalIds||{})[location.hostname.replace(/^www\./,'')];
+    const box = id && inputs.find(e=>/^(text|email|tel|number|)$/.test(e.type) && e.tagName==='INPUT' && !e.value && !e.disabled && !e.readOnly && !BLOCK_ID.test(fullId(e)) && !/captcha|otp|code/i.test(fullId(e)+' '+labelsOf(e).primary.join(' ')));
+    if (box) { setValue(box, id); mark(box,'#1E7A4C'); rep.filled.push({k:'portalId', l:String(labelsOf(box).primary[0]||'User ID').slice(0,60), v:id, how:'saved'}); rep.loginId = true; } }
+  // nothing to fill and no form here (home page, Careers list, the job's details page): find the way to the form
+  if (payload.job && rep.stage === 'form' && textInputs < 3 && !rep.filled.length && !rep.manual.length && !formy) { rep.way = findWay(payload.job, payload.portalIds); rep.stage = 'find'; }
   if (decl) { const cb=document.getElementById('CheckBox1')||document.getElementById('chkdec'); mark(cb.parentElement||cb,'#E0A100','manual'); cb.scrollIntoView({block:'center'});
     const adv=document.querySelector("a[onclick*='Advertisement']"); if (adv) { rep.needsAdvert=true; mark(adv,'#E0A100','manual'); } }
   return rep;
@@ -608,5 +909,5 @@ function inventory(valuesIn, isoIn){
       value: el.type==='radio'||el.type==='checkbox' ? (el.checked?'✓':'') : (el.tagName==='SELECT'?(el.options[el.selectedIndex]||{}).text:el.value)};
   });
 }
-window.MPHubAgent = {run, inventory, applyMapping, version:VERSION};
+window.MPHubAgent = {run, inventory, applyMapping, siteSearch, fillOtp, version:VERSION};
 })();

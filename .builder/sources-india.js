@@ -7,6 +7,7 @@
    ssc(): Staff Selection Commission notice board, read from ssc.gov.in's own API.
    upsc(): UPSC active examinations page. */
 const crypto = require('crypto');
+const { findApplyPage } = require('./deeplink');
 const UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0 Mobile Safari/537.36';
 const get = async (u, opt = {}) => { const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 45000);
   try { const r = await fetch(u, { ...opt, signal: ctl.signal, headers: { 'User-Agent': UA, ...(opt.headers || {}) } }); if (!r.ok) throw new Error(r.status + ' ' + u); return await r.text(); } finally { clearTimeout(t); } };
@@ -43,9 +44,17 @@ async function discovery(cache, max = 60, maxPdf = 0) {
   for (const x of out) {
     const c = cache[x.key];
     x.mode = modeOf(x);
-    if (c && c.v === 3) { Object.assign(x, c); continue; }
-    if (fetched >= max) continue; fetched++;
-    try { const o = officialLinks(await get(x.ref)); Object.assign(x, o); Object.assign(o, x.mode === 'online' ? await applyCheck(x) : { applyKind: null }, { v: 3 }); Object.assign(x, cache[x.key] = o); } catch (e) { }
+    if (c && c.v === 4) { Object.assign(x, c); continue; }
+    if (fetched >= max) { if (c) Object.assign(x, c); continue; } fetched++;
+    try {
+      const o = officialLinks(await get(x.ref)); if (c) { for (const k of ['salary', 'payLevel', 'stipend', 'salarySrc', 'pdfTried']) if (o[k] == null && c[k] != null) o[k] = c[k]; }
+      Object.assign(x, o); Object.assign(o, x.mode === 'online' ? await applyCheck(x) : { applyKind: null }, { v: 4 });
+      // only a home page (or no apply link): look for this job's current application page on the official site
+      if (x.mode === 'online' && (o.applyKind === 'home' || o.applyKind == null || o.applyKind === 'dead') && (o.site || o.apply)) {
+        const f = await findApplyPage({ ...x, ...o }).catch(() => null); if (f) Object.assign(o, f);
+      }
+      Object.assign(x, cache[x.key] = o);
+    } catch (e) { if (c) Object.assign(x, c); }
   }
   // no salary on the job page: read it from the official notification PDF (once per job, at most maxPdf per run)
   let pdfs = 0;
@@ -57,10 +66,13 @@ async function discovery(cache, max = 60, maxPdf = 0) {
 /* official links in a listing's detail page: notification PDF, apply link, official website (never other listing sites) */
 function officialLinks(html) {
   const body = html.split(/Important Links|Useful Links|Important Link/i).slice(1).join(' ') || html;
-  const as = [...body.matchAll(/<a [^>]*href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi)].map(m => ({ u: m[1].replace(/&amp;/g, '&'), t: text(m[2]) }))
+  // a link's meaning is usually in its row label ("Apply Online: Click Here"), so read the label with the link text
+  const as = body.split(/<\/li>|<\/tr>|<\/p>|<br\s*\/?>/i).flatMap(chunk => [...chunk.matchAll(/<a [^>]*href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi)]
+      .map(m => { const own = text(m[2]); const label = text(chunk.replace(m[0], ' ')).replace(/[:\-–|]+\s*$/, '').slice(0, 120); return { u: m[1].replace(/&amp;/g, '&'), t: /^(click|here|link|download|visit)\b/i.test(own) || own.length < 4 ? label + ' ' + own : own }; }))
     .filter(a => !/freejobalert|sarkari|telegram|whatsapp|facebook|twitter|instagram|youtube|google|cluestoday|marketshost|rojgarlive|stylishscape|t\.me|play\.google|linkedin/i.test(a.u));
   const gov = a => /\.(gov|nic|ac|edu|res)\.in\b|\.gov\b|\.org\.in\b|ibps\.in|bank|rrb|cdac|nta\.ac\.in/i.test(a.u);
-  const pdf = as.find(a => /\.pdf(\?|$)/i.test(a.u)), apply = as.find(a => /apply|application|registration|register|form/i.test(a.t) && !/\.pdf/i.test(a.u)), site = as.find(a => /^www\.|official website|website/i.test(a.t)) || as.find(gov);
+  const pdf = as.find(a => /\.pdf(\?|$)/i.test(a.u) && /notification|advertisement|advt|pdf/i.test(a.t)) || as.find(a => /\.pdf(\?|$)/i.test(a.u)),
+    apply = as.find(a => /apply|application|registration|register|form/i.test(a.t) && !/result|admit|answer key|\.pdf/i.test(a.t + ' ' + a.u)), site = as.find(a => /^www\.|official website|website/i.test(a.t)) || as.find(gov);
   return { pdf: pdf ? pdf.u : null, apply: apply ? apply.u : null, site: site ? site.u : null, ...salaryOf(html) };
 }
 /* expected salary from a job's detail page: the "Salary / Initial Salary" box (₹21,700 - ₹35,400 /month), else the

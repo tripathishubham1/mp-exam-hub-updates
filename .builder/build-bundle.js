@@ -197,7 +197,7 @@ async function main() {
     // FEED_ONLY=1 (nightly checks failed): ship fresh notices but keep last night's agent + model
     for (const f of ['agent.js', 'fieldmodel.js', 'fieldmodel-data.js']) if (!(process.env.FEED_ONLY && fs.existsSync(path.join(OUT, f)))) fs.copyFileSync(path.join(ROOT, 'www', f), path.join(OUT, f));
     // the builder travels with the bundle so GitHub Actions runs exactly this code
-    fs.mkdirSync(path.join(OUT, '.builder'), { recursive: true }); fs.copyFileSync(__filename, path.join(OUT, '.builder', 'build-bundle.js')); fs.copyFileSync(path.join(__dirname, 'sources-india.js'), path.join(OUT, '.builder', 'sources-india.js'));
+    fs.mkdirSync(path.join(OUT, '.builder'), { recursive: true }); fs.copyFileSync(__filename, path.join(OUT, '.builder', 'build-bundle.js')); fs.copyFileSync(path.join(__dirname, 'sources-india.js'), path.join(OUT, '.builder', 'sources-india.js')); fs.copyFileSync(path.join(__dirname, 'deeplink.js'), path.join(OUT, '.builder', 'deeplink.js'));
   }
   const files = {};
   for (const f of ['feed.json', 'events.json', 'rules.json', 'agent.js', 'fieldmodel.js', 'fieldmodel-data.js']) { if (!fs.existsSync(path.join(OUT, f))) continue; const b = fs.readFileSync(path.join(OUT, f)); files[f] = { sha256: crypto.createHash('sha256').update(b).digest('base64'), size: b.length }; }
