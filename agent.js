@@ -231,7 +231,7 @@ function derive(values, iso){
 }
 const NAME_FAMILY = new Set(['nameAny','name','nameEn','father','mother','spouse']);
 let ENGLISH_ONLY = false;
-const titleCase = s => s.replace(/w/g, c=>c.toUpperCase());
+const titleCase = s => s.toLowerCase().replace(/\b\w/g, c=>c.toUpperCase());
 function resolveValue(key, values, labs, el){
   if (key==='hasProfile') { const t=labs.join(' '); const askNew=/नया|new/i.test(t) && !/पूर्व|पहले|already|existing|registered|पंजीकृत/i.test(t); return askNew ? (values.esbProfile?'नहीं':'हाँ') : values.hasProfile; }
   if (key==='district' && el.tagName!=='SELECT' && DISTRICTS[values.district] && (ENGLISH_ONLY || englishField(el) || !hasDeva(labs.join(' ')))) return titleCase(DISTRICTS[values.district]);
@@ -306,6 +306,12 @@ function b64ToFile(dataUrl, name){
 
 /* ---------- decide what each control wants ---------- */
 function questionOf(rs){
+  // the line right above the first option ("<p>Have you changed your name?</p> <label>◯ Yes</label> <label>◯ No</label>")
+  const own = rs[0].closest('label') || rs[0];
+  for (let p = own.previousElementSibling, k = 0; p && k < 3; k++, p = p.previousElementSibling) {
+    if (p.querySelector && p.querySelector('input:not([type=hidden]),select')) { if (Array.from(p.querySelectorAll('input')).some(i => rs.includes(i))) continue; break; }
+    const t = textOf(p); if (t && t.length > 3) return t.slice(0, 160);
+  }
   let node = rs[0].closest('table,div,fieldset,span') || rs[0].parentElement;
   for (let n=0; node && n<6; n++, node=node.parentElement) {
     if (!rs.every(r=>node.contains(r))) continue;
@@ -321,6 +327,15 @@ function askModel(label, context, el, type, options){
   const sure = M.decide(ex); if (sure) return {key: sure.key, sure: true, p: sure.p};
   const guess = M.predict(ex); return guess && guess.key!=='none' && guess.p>=0.6 ? {key: guess.key, sure: false, p: guess.p} : null;
 }
+/* a "@ domain" drop-down right next to an email box (options like gmail.com / yahoo.co.in) */
+const ALT_NO = /alternat|\balt(?:ernate)?\b|altphone|altmob|other\s*(?:mobile|number|phone)|second(?:ary)?\s*(?:mobile|number)|landline|वैकल्पिक|अन्य\s*मोबाइल/i;
+function emailDomainSelect(el){
+  for (const box of [el.parentElement, el.parentElement&&el.parentElement.parentElement, el.closest('td,tr,.form-group,.row')].filter(Boolean)) {
+    const s = Array.from(box.querySelectorAll('select')).find(x=>{ const o=Array.from(x.options).map(o=>o.text.trim().toLowerCase()); return o.filter(t=>/^@?[a-z0-9-]+(\.[a-z]{2,})+$/.test(t)).length>=3; });
+    if (s) return s;
+  }
+  return null;
+}
 function classify(el, values){
   const labs = labelsOf(el);
   const all = labs.primary.concat(labs.context).join(' | ');
@@ -328,8 +343,13 @@ function classify(el, values){
   if (el.type==='password' || BLOCK_ID.test(fullId(el)) || labs.primary.some(t=>BLOCK.test(t)) || labs.context.some(t=>/captcha|कैप्चा|enter answer|security code/i.test(t))) return {blocked:true, short};
   let key = el.getAttribute('data-mphub-key') || keyFromId(el), how = el.hasAttribute('data-mphub-key') ? 'ai' : 'id';
   if (!key) { const r = keyFromLabel(labs.primary.length?labs.primary:labs.context); if (r) { key=r.key; how='label'; } }
+  // the visible label beats a misleading id (IBPS: id "fullname" is labelled "First Name")
+  else if (how==='id' && ['nameAny','name','nameEn'].includes(key) && labs.primary.length) { const r = keyFromLabel(labs.primary); if (r && ['firstName','middleName','lastName'].includes(r.key)) { key=r.key; how='label'; } }
+  // a second / alternative / landline number must differ from the student's mobile: never copy the mobile there
+  if ((key==='mobile' || key==='phone') && ALT_NO.test(all+' '+fullId(el))) key = null;
   let suggest = null;
   if (!key && el.type!=='file') { const m = askModel(labs.primary.join(' | '), labs.context.join(' | '), el, el.tagName==='SELECT'?'select':'text', el.tagName==='SELECT'?Array.from(el.options).map(o=>o.text):[]); if (m && m.sure) { key=m.key; how='model'; } else if (m) suggest=m.key; }
+  if (key==='mobile' && ALT_NO.test(all+' '+fullId(el))) { key=null; suggest=null; }   // also after the model
   return {key, how, short, labs:labs.primary.length?labs.primary:labs.context, all, suggest};
 }
 
@@ -337,7 +357,9 @@ function classify(el, values){
 /* exam lists / portal home pages: nothing to fill here, the app navigates to the exam's own form */
 const HUB_PATH = /attestation\/home\/home\.aspx$|\/vyapam\/examslist\.aspx$|^\/?$|\/default\.aspx$|\/index\.aspx$/i;
 function run(payload){
-  if (HUB_PATH.test(location.pathname) && !/Message=/.test(location.search)) return {filled:[], already:[], conflict:[], manual:[], blocked:0, files:[], checkboxes:0, postback:false, unknown:[], page:document.title, version:VERSION, stage:'hub'};
+  // (single-page portals like rrbapply.gov.in keep their forms at "/" behind a #/route: a page with a real form is never a hub)
+  const formy = Array.from(document.querySelectorAll('input[type=text],input:not([type]),input[type=email],input[type=tel],select,textarea')).filter(e=>!e.disabled && visible(e)).length >= 3;
+  if (HUB_PATH.test(location.pathname) && !/Message=/.test(location.search) && !formy) return {filled:[], already:[], conflict:[], manual:[], blocked:0, files:[], checkboxes:0, postback:false, unknown:[], page:document.title, version:VERSION, stage:'hub'};
   const iso = payload.iso||{}, files = payload.files||{};
   const values = derive(payload.values||{}, iso);
   const rep = {filled:[], already:[], conflict:[], manual:[], blocked:0, files:[], checkboxes:0, postback:false, page:document.title||location.hostname, version:VERSION, unknown:[]};
@@ -368,7 +390,7 @@ function run(payload){
       const lab = short(q || c.short);
       if (c.blocked || BLOCK.test(q)) { rep.blocked++; continue; }
       const rv = key ? resolveValue(key, values, [q], rs[0]) : null;
-      if (!key || rv==null || rv==='') { if (!rs.some(r=>r.checked)) { rep.manual.push(lab); if (!key) askAI(rs, q || c.short, c.all, 'radio', rs.map(r=>norm((r.labels&&r.labels[0]?r.labels[0].textContent:'')||(r.nextSibling&&r.nextSibling.nodeType===3?r.nextSibling.textContent:'')||r.value))); } continue; }
+      if (!key || rv==null || rv==='') { if (!rs.some(r=>r.checked)) { rep.manual.push(lab); mark(rs[0].closest('td,div,fieldset,li')||rs[0].parentElement||rs[0],'#E0A100','manual'); if (!key) askAI(rs, q || c.short, c.all, 'radio', rs.map(r=>norm((r.labels&&r.labels[0]?r.labels[0].textContent:'')||(r.nextSibling&&r.nextSibling.nodeType===3?r.nextSibling.textContent:'')||r.value))); } continue; }
       if (rs.some(r=>r.checked)) { rep.already.push({k:key, l:lab}); continue; }
       const optLabel = r => norm((r.labels&&r.labels[0]?r.labels[0].textContent:'') || (r.nextSibling&&r.nextSibling.nodeType===3?r.nextSibling.textContent:'') || (r.nextElementSibling?r.nextElementSibling.textContent:'') || r.value);
       let best=null, bs=0; rs.forEach(r=>{ const s=Math.max(matchOption(optLabel(r), rv), matchOption(r.value, rv)); if(s>bs){bs=s;best=r;} });
@@ -434,6 +456,13 @@ function run(payload){
         setValue(el, el.options[bi].value); mark(el,'#1E7A4C'); rep.filled.push({k:key,l:c.short,v:el.options[bi].text,how:c.how}); changed++;
         continue;
       }
+      // email split into "name" box + "@ domain" list (IBPS, many central portals): name part here, domain from the list
+      if (key==='email' && /@/.test(v)) { const dsel = emailDomainSelect(el); if (dsel) {
+          const [local, dom] = String(v).split('@'); const oi = Array.from(dsel.options).findIndex(o=>o.text.trim().toLowerCase().replace(/^@/,'')===dom.toLowerCase() || o.value.toLowerCase().replace(/^@/,'')===dom.toLowerCase());
+          if (oi<0) { if (!el.value) { rep.manual.push(c.short+' (ईमेल डोमेन सूची में नहीं)'); mark(el,'#E0A100','manual'); } continue; }
+          if (!el.value) { setValue(el, local); mark(el,'#1E7A4C'); rep.filled.push({k:key,l:c.short,v:local,how:c.how}); changed++; }
+          if (isEmptySelect(dsel) || !/\./.test(dsel.options[dsel.selectedIndex].text)) { setValue(dsel, dsel.options[oi].value); mark(dsel,'#1E7A4C'); done.add(dsel); }
+          continue; } }
       if (el.value && el.value.trim()) { if (norm(el.value)!==norm(v)) { rep.conflict.push({k:key,l:c.short,have:el.value,want:v}); mark(el,'#E2551F','conflict'); } else rep.already.push({k:key,l:c.short}); continue; }
       if (el.maxLength>0 && String(v).length>el.maxLength) { rep.manual.push(c.short+' (लंबाई सीमा)'); mark(el,'#E0A100','manual'); continue; }
       setValue(el, String(v)); mark(el,'#1E7A4C'); rep.filled.push({k:key,l:c.short,v,how:c.how}); changed++;
@@ -472,7 +501,7 @@ function run(payload){
   const msgClosed = (/Message=/.test(location.search) && /Home.aspx/i.test(location.pathname)) || /reg_close|date.?expired|last_date.*over|applicationclosed/i.test(location.href) || (/date expired|registration (is )?closed|last date .*(is )?over/i.test(bodyText) && textInputs<2);
   // journey stages: where in the portal's flow is the student?
   const path = location.pathname.toLowerCase();
-  const isHub = HUB_PATH.test(path) && !msgClosed || (/^\/?$|\/index\.aspx$|\/portal\/?$/.test(path) && document.querySelectorAll('a[href*="notifications.aspx"],a[href*="Declaration.aspx"]').length>0 && textInputs<=3);
+  const isHub = HUB_PATH.test(path) && !msgClosed && !formy || (/^\/?$|\/index\.aspx$|\/portal\/?$/.test(path) && document.querySelectorAll('a[href*="notifications.aspx"],a[href*="Declaration.aspx"]').length>0 && textInputs<=3);
   const hasPassword = inputs.some(e=>e.type==='password');
   const otpField = inputs.find(e=>/(^|[_$])(txt)?otp(code|no|value|number|txt)?($|[_$])|enterotp|verifyotp/i.test((e.id||'')+' '+(e.name||'')) && !e.value);
   // success / receipt pages: read off the new profile number or application number (only on pages without a form)
@@ -503,20 +532,70 @@ function applyMapping(map, payload){
   (map||[]).forEach(m=>{ if (!m || !m.key || typeof m.i!=='number') return; document.querySelectorAll('[data-mphub-u="'+m.i+'"]').forEach(e=>{ e.setAttribute('data-mphub-key', m.key); tagged++; }); });
   const r = run(payload); r.aiTagged = tagged; r.aiFilled = r.filled.filter(f=>f.how==='ai').length; return r;
 }
-/* fields that appear later without a page load (UpdatePanel, show/hide) get filled too, for 60 s */
+/* ---------- wait for the student, then carry on ----------
+   Things only the student may do (OTP, captcha, password, Aadhaar, questions the profile can't answer, calendar pickers)
+   are listed in a small "waiting for you" bar at the bottom of the portal page; tapping an item scrolls to it.
+   The agent keeps watching the page: when the student completes something, a new part of the form appears (after OTP
+   verification, a "Yes/No" that reveals more fields, a single-page portal moving to its next step) or a field becomes
+   enabled, it fills again. It only ever fills empty fields, so nothing the student typed is overwritten. */
 let watcher = null, lastPayload = null;
+const L10N = (hi, en) => (lastPayload && lastPayload.lang === 'en') ? en : hi;
+function needsStudent(){
+  const out = [], seen = new Set();
+  for (const el of Array.from(document.querySelectorAll('input,select,textarea'))) {
+    if (el.type==='hidden' || el.disabled || !visible(el) || ['submit','button','image','reset'].includes(el.type)) continue;
+    if (el.type==='radio') { const g=Array.from(document.getElementsByName(el.name||'')).filter(x=>x.type==='radio'); if (g.some(x=>x.checked) || !g.some(x=>x.closest('[data-mphub="manual"]'))) continue; }
+    else if (el.type==='checkbox') { if (el.checked || !(el.getAttribute('data-mphub')==='manual' || (el.parentElement&&el.parentElement.getAttribute('data-mphub')==='manual'))) continue; }
+    else if (el.tagName==='SELECT' ? !isEmptySelect(el) : String(el.value||'').trim()) continue;
+    const id = (el.id||'')+' '+(el.name||''), labs = labelsOf(el), all = labs.primary.concat(labs.context).join(' ');
+    const lab = ((el.type==='radio' ? questionOf(Array.from(document.getElementsByName(el.name)).filter(x=>x.type==='radio')) : '') || labs.primary[0] || labs.context[0] || compactId(el) || '').slice(0,60);
+    let kind = null;
+    if (/otp|one.?time/i.test(id+' '+all)) kind = 'OTP';
+    else if (/captcha|security\s*code|कैप्चा|imgcode|txtcode|verification code/i.test(id+' '+all)) kind = L10N('कैप्चा','Captcha');
+    else if (el.type==='password') kind = L10N('पासवर्ड','Password');
+    else if (/aadha+r|आधार|\buid\b/i.test(id+' '+all)) kind = L10N('आधार','Aadhaar');
+    else if (el.type==='radio' || el.getAttribute('data-mphub')==='manual' || (el.parentElement&&el.parentElement.getAttribute('data-mphub')==='manual') || (el.readOnly && /date|dob|birth|तिथि/i.test(id+' '+all))) kind = '';
+    else continue;
+    if (!kind && !el.required && !/\*/.test(all) && el.getAttribute('data-mphub')!=='manual' && !(el.readOnly && /date|dob|birth|तिथि/i.test(id+' '+all)) && el.type!=='radio') continue;
+    const key = (kind||'')+'|'+(el.type==='radio'?el.name:lab); if (seen.has(key)) continue; seen.add(key);
+    if (el.readOnly && !el.getAttribute('data-mphub')) mark(el,'#E0A100','manual');
+    out.push({el: el.type==='radio' ? (el.closest('td,div,fieldset')||el) : el, label: kind ? kind + (lab && !new RegExp(kind,'i').test(lab) ? ' · '+lab : '') : lab});
+    if (out.length>=8) break;
+  }
+  return out;
+}
+function waitBar(){
+  let bar = document.getElementById('mphub-wait');
+  const items = needsStudent();
+  if (!items.length) { if (bar) { bar.remove(); document.body.style.paddingBottom = ''; } return items; }
+  if (!bar) { bar = document.createElement('div'); bar.id='mphub-wait';
+    bar.setAttribute('style','position:fixed;left:8px;right:8px;bottom:8px;z-index:2147483646;background:#1B1530;color:#fff;border-radius:14px;padding:10px 12px;font:14px/1.35 system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.3);max-height:40vh;overflow:auto');
+    document.body.appendChild(bar); }
+  bar.innerHTML = '';
+  const h = document.createElement('div'); h.style.cssText='font-weight:700;margin-bottom:6px;cursor:pointer'; h.onclick = () => { bar.dataset.min = bar.dataset.min ? '' : '1'; waitBar(); }; h.textContent = L10N('आपका इंतज़ार है ('+items.length+'): ये खुद भरें, फिर भरना अपने-आप आगे बढ़ेगा', 'Waiting for you ('+items.length+'): fill these yourself, then filling continues on its own'); bar.appendChild(h);
+  if (bar.dataset.min) h.textContent += ' ▴'; else for (const it of items) { const b = document.createElement('button'); b.type='button'; b.textContent = '› ' + it.label;
+    b.setAttribute('style','display:block;width:100%;text-align:left;background:rgba(255,255,255,.1);color:#fff;border:0;border-radius:10px;padding:10px 12px;margin-top:6px;font:inherit;min-height:44px');
+    b.onclick = () => { it.el.scrollIntoView({block:'center', behavior:'smooth'}); try { (it.el.focus? it.el : it.el.querySelector('input,select'))?.focus({preventScroll:true}); } catch(e){} };
+    bar.appendChild(b); }
+  document.body.style.paddingBottom = (bar.offsetHeight + 16) + 'px';   // the portal's own buttons stay reachable above the bar
+  return items;
+}
 function watchForNewFields(payload){
   lastPayload = payload;
+  setTimeout(waitBar, 50);
   if (watcher) return;
-  let timer = null; const started = Date.now();
-  const count = () => Array.from(document.querySelectorAll('input,select,textarea')).filter(e=>e.type!=='hidden' && visible(e)).length;
-  let seen = count();
-  watcher = new MutationObserver(()=>{
-    if (Date.now()-started > 60000) { watcher.disconnect(); watcher=null; return; }
-    clearTimeout(timer);
-    timer = setTimeout(()=>{ const n=count(); if (n>seen) { seen=n; try { const r=run(lastPayload); r.auto=true; window.__mphubLast = r; } catch(e){} } }, 700);
-  });
-  watcher.observe(document.body, {childList:true, subtree:true, attributes:true, attributeFilter:['style','class','disabled']});
+  let timer = null;
+  const fp = () => Array.from(document.querySelectorAll('input,select,textarea')).filter(e=>e.type!=='hidden' && !e.disabled && visible(e)).map(e=>e.id||e.name||e.type).join(',');
+  let seen = fp();
+  const again = (why) => { try { const r=run(lastPayload); r.auto=true; r.why=why; window.__mphubLast = r; } catch(e){} };
+  const check = () => { const now = fp(); if (now !== seen) { const grew = now.split(',').some(x=>!seen.split(',').includes(x)); seen = now; if (grew) { again('new-fields'); return; } } waitBar(); };
+  // the page changes (new section, step 2 of a single-page portal, a field switched on)
+  watcher = new MutationObserver(m=>{ if (m.every(x=>x.target && x.target.closest && x.target.closest('#mphub-wait'))) return; clearTimeout(timer); timer = setTimeout(check, 700); });
+  watcher.observe(document.body, {childList:true, subtree:true, attributes:true, attributeFilter:['style','class','disabled','hidden']});
+  // the student did something (typed the OTP, answered a question): refresh the list, and fill whatever that unlocked
+  const onUser = ev => { if (!ev.isTrusted || (ev.target && ev.target.closest && ev.target.closest('#mphub-wait'))) return; clearTimeout(timer); timer = setTimeout(()=>{ const before = needsStudent().length; check(); if (before === 0 || ev.type==='change') again('student'); }, 1200); };
+  document.addEventListener('change', onUser, true); document.addEventListener('input', onUser, true);
+  window.addEventListener('hashchange', ()=>setTimeout(()=>{ seen=''; check(); }, 900));   // single-page portals (#/route)
 }
 /* diagnostics for the test rig */
 function inventory(valuesIn, isoIn){

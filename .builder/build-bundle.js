@@ -103,7 +103,7 @@ async function iforms() {
 const INDIA = (() => { try { return require('./sources-india.js'); } catch (e) { return require(path.join(__dirname, 'sources-india.js')); } })();
 let jobsCache = {};
 async function jobs() {
-  const parts = await Promise.allSettled([INDIA.discovery(jobsCache, CI ? 60 : 400), INDIA.ssc(), INDIA.upsc()]);
+  const parts = await Promise.allSettled([INDIA.discovery(jobsCache, CI ? 60 : 400, CI ? 0 : 150), INDIA.ssc(), INDIA.upsc()]);
   const [d, sc, up] = parts.map(p => p.status === 'fulfilled' ? p.value : null);
   if (!d && !sc && !up) throw new Error(parts.map(p => p.reason && p.reason.message).filter(Boolean).join(' | '));
   // listing rows are the recruitments themselves (posts, qualification, last date); the official SSC / UPSC readers add their notices
