@@ -42,7 +42,7 @@ async function discovery(cache, max = 60) {
   let fetched = 0;
   for (const x of out) {
     const c = cache[x.key];
-    if (c) { Object.assign(x, c); continue; }
+    if (c && c.v === 2) { Object.assign(x, c); continue; }
     if (fetched >= max) continue; fetched++;
     try { Object.assign(x, cache[x.key] = officialLinks(await get(x.ref))); } catch (e) { }
   }
@@ -56,7 +56,22 @@ function officialLinks(html) {
     .filter(a => !/freejobalert|sarkari|telegram|whatsapp|facebook|twitter|instagram|youtube|google|cluestoday|marketshost|rojgarlive|stylishscape|t\.me|play\.google|linkedin/i.test(a.u));
   const gov = a => /\.(gov|nic|ac|edu|res)\.in\b|\.gov\b|\.org\.in\b|ibps\.in|bank|rrb|cdac|nta\.ac\.in/i.test(a.u);
   const pdf = as.find(a => /\.pdf(\?|$)/i.test(a.u)), apply = as.find(a => /apply|application|registration|register|form/i.test(a.t) && !/\.pdf/i.test(a.u)), site = as.find(a => /^www\.|official website|website/i.test(a.t)) || as.find(gov);
-  return { pdf: pdf ? pdf.u : null, apply: apply ? apply.u : null, site: site ? site.u : null };
+  return { v: 2, pdf: pdf ? pdf.u : null, apply: apply ? apply.u : null, site: site ? site.u : null, ...salaryOf(html) };
+}
+/* expected salary from a job's detail page: the "Salary / Initial Salary" box (₹21,700 - ₹35,400 /month), else the
+   "Pay Scale / Pay Level" row, else a stipend line. stipend:true marks training stipends (not a regular salary). */
+function salaryOf(html) {
+  const t = html.replace(/<script[\s\S]*?<\/script>/g, '').replace(/<\/(tr|p|li|h\d|div)>/gi, '\n').replace(/<\/t[dh]>/gi, ' | ').replace(/<[^>]+>/g, ' ')
+    .replace(/&#8211;|&ndash;/g, '-').replace(/&#8377;|&#x20b9;/gi, '₹').replace(/&nbsp;|&#160;/g, ' ').replace(/&amp;/g, '&').replace(/[ \t]+/g, ' ');
+  const L = t.split('\n').map(x => x.trim()).filter(Boolean);
+  const money = /₹\s?[\d,]{4,}(?:\s*[-–]\s*₹?\s?[\d,]{4,})?(?:\s*\/\s*(?:month|pm|year|annum))?/i;
+  let salary = null, level = null;
+  for (let i = 0; i < L.length - 1 && !salary; i++) if (/^(?:initial\s+)?(?:salary|pay|stipend)$/i.test(L[i])) { const m = (L[i + 1].match(money) || L[i + 2] && L[i + 2].match(money) || [])[0]; if (m) salary = m; }
+  const row = L.find(x => /^(?:pay\s*scale|pay\s*level|salary|pay|stipend)\s*\|/i.test(x));
+  if (row) { const v = row.split('|').slice(1).join(' ').trim(); if (/level|₹|rs\.?\s?\d|\d{4,}/i.test(v)) level = v.slice(0, 80); }
+  if (!salary && level) { const m = level.match(/(?:₹|Rs\.?)\s?[\d,]{4,}(?:\s*[-–\/]\s*(?:₹|Rs\.?)?\s?[\d,]{4,})?/i); if (m) salary = m[0].replace(/Rs\.?\s?/gi, '₹'); }
+  const stipend = /stipend/i.test((L.find(x => money.test(x) && /stipend/i.test(x)) || '') + ' ' + (row || '')) || /^(?:stipend)/i.test(row || '');
+  return { salary: salary ? salary.replace(/\s+/g, ' ') : null, payLevel: level && /level/i.test(level) ? level.replace(/^.*?(7th CPC\s*)?(pay\s*)?(level)/i, 'Level').slice(0, 40) : null, stipend: stipend || undefined };
 }
 
 async function ssc() {
@@ -79,4 +94,4 @@ async function upsc() {
   return out;
 }
 
-module.exports = { discovery, ssc, upsc, officialLinks, OWN };
+module.exports = { discovery, ssc, upsc, officialLinks, salaryOf, OWN };
