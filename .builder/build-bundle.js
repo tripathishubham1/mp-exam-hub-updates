@@ -181,6 +181,8 @@ async function main() {
   const feed = { at, items, exams, sources: { mppscAdverts: sources.mppscAdverts, iforms: sources.iforms, jobs: sources.jobs.map(x => ({ key: x.key, src: x.src, title: x.title, last: x.last, ext: true, pdf: x.pdf || null, site: x.site || null })) }, errors };
   // nothing new since the last run: keep the published files untouched (no commit, no phone download)
   const same = JSON.stringify([prev.items, prev.exams, prev.sources]) === JSON.stringify([items, exams, feed.sources]);
+  if (errors.length) console.log('source errors: ' + errors.join(' | '));
+  for (const k of Object.keys(parts)) console.log('  ' + k + ': ' + (parts[k] ? parts[k].length + ' read' : 'FAILED, kept last run'));
   if (CI && same && !fresh.length) { console.log('no change in notices'); return; }
   if (same && prev.at) feed.at = prev.at;
   fs.writeFileSync(path.join(OUT, 'feed.json'), JSON.stringify(feed));
